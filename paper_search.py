@@ -17,12 +17,140 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any
 
 
 CURRENT_YEAR = 2026
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
+OPENALEX_SOURCES_URL = "https://api.openalex.org/sources"
+SOURCE_QUERIES = [
+    "credit risk",
+    "default risk",
+    "default prediction",
+    "credit scoring",
+    "financial distress",
+    "bankruptcy",
+    "business failure",
+    "loan default",
+    "non-performing loans",
+    "creditworthiness",
+]
+
+UTD24_JOURNALS = {
+    "Academy of Management Journal",
+    "Academy of Management Review",
+    "Accounting Review",
+    "Administrative Science Quarterly",
+    "Contemporary Accounting Research",
+    "Information Systems Research",
+    "Journal of Accounting and Economics",
+    "Journal of Accounting Research",
+    "Journal of Consumer Research",
+    "Journal of Finance",
+    "Journal of Financial Economics",
+    "Journal of International Business Studies",
+    "Journal of Marketing",
+    "Journal of Marketing Research",
+    "Management Science",
+    "Manufacturing & Service Operations Management",
+    "Marketing Science",
+    "MIS Quarterly",
+    "Operations Research",
+    "Organization Science",
+    "Production and Operations Management",
+    "Review of Financial Studies",
+    "Strategic Management Journal",
+    "The Accounting Review",
+}
+
+FT50_JOURNALS = {
+    "Academy of Management Annals",
+    "Academy of Management Journal",
+    "Academy of Management Review",
+    "Accounting Review",
+    "Accounting, Organizations and Society",
+    "Administrative Science Quarterly",
+    "American Economic Review",
+    "American Sociological Review",
+    "Contemporary Accounting Research",
+    "Econometrica",
+    "Entrepreneurship Theory and Practice",
+    "Harvard Business Review",
+    "Human Resource Management",
+    "Information Systems Research",
+    "Journal of Accounting and Economics",
+    "Journal of Accounting Research",
+    "Journal of Applied Psychology",
+    "Journal of Business Venturing",
+    "Journal of Consumer Psychology",
+    "Journal of Consumer Research",
+    "Journal of Finance",
+    "Journal of Financial and Quantitative Analysis",
+    "Journal of Financial Economics",
+    "Journal of International Business Studies",
+    "Journal of Management",
+    "Journal of Management Information Systems",
+    "Journal of Management Studies",
+    "Journal of Marketing",
+    "Journal of Marketing Research",
+    "Journal of Operations Management",
+    "Journal of Political Economy",
+    "Journal of the Academy of Marketing Science",
+    "Management Science",
+    "Manufacturing & Service Operations Management",
+    "Marketing Science",
+    "MIS Quarterly",
+    "MIT Sloan Management Review",
+    "Operations Research",
+    "Organization Science",
+    "Organizational Behavior and Human Decision Processes",
+    "Production and Operations Management",
+    "Psychological Science",
+    "Quarterly Journal of Economics",
+    "Research Policy",
+    "Review of Accounting Studies",
+    "Review of Economic Studies",
+    "Review of Finance",
+    "Review of Financial Studies",
+    "Strategic Entrepreneurship Journal",
+    "Strategic Management Journal",
+}
+
+PRIORITY_WHITELIST_JOURNALS = {
+    "Accounting Review",
+    "AccountingOrganizationsandSociety",
+    "AmericanEconomicReview",
+    "ContemporaryAccountingResearch",
+    "Econometrica",
+    "EconomicJournal",
+    "EuropeanEconomicReview",
+    "InformationSystemsResearch",
+    "JournalofAccounting&Economics",
+    "JournalofAccountingResearch",
+    "JournalofBanking&Finance",
+    "JournalofBusiness&EconomicStatistics",
+    "JournalofCorporateFinance",
+    "JournalofEconometrics",
+    "JournalofEconomicTheory",
+    "JournalofFinance",
+    "JournalofFinancialandQuantitativeAnalysis",
+    "JournalofFinancialEconomics",
+    "JournalofFinancialIntermediation",
+    "JournalofInternationalEconomics",
+    "JournalofMonetaryEconomics",
+    "JournalofPoliticalEconomy",
+    "JournalofPublicEconomics",
+    "ManagementScience",
+    "MISQuarterly",
+    "OperationsResearch",
+    "QuarterlyJournalofEconomics",
+    "ReviewofEconomicStudies",
+    "ReviewofEconomicsandStatistics",
+    "ReviewofFinance",
+    "ReviewofFinancialStudies",
+}
 
 QUERIES = [
     "credit risk default prediction imbalanced data",
@@ -79,6 +207,8 @@ NORMALIZED_TARGET_JOURNALS = {
 
 KEYWORD_PATTERNS = [
     ("credit risk", r"\bcredit risk\b"),
+    ("default risk", r"\bdefault[- ]risk\b|\bdefault risk\b"),
+    ("non-performing loans", r"\bnon[- ]performing loans?\b|\bnonperforming loans?\b|\bnpls?\b"),
     ("default prediction", r"\b(default|defaults|defaulting)\b.*\b(prediction|forecasting|model|models)\b"),
     ("bankruptcy forecasting", r"\b(bankruptcy|insolvency)\b.*\b(prediction|forecasting|model|models)\b"),
     ("financial distress", r"\bfinancial distress\b"),
@@ -95,6 +225,8 @@ KEYWORD_PATTERNS = [
 
 PRIMARY_TOPIC_LABELS = {
     "credit risk",
+    "default risk",
+    "non-performing loans",
     "default prediction",
     "bankruptcy forecasting",
     "financial distress",
@@ -125,6 +257,212 @@ def normalize_journal_name(name: str | None) -> str:
 
 
 NORMALIZED_TARGET_JOURNALS = {normalize_journal_name(name) for name in TARGET_JOURNALS}
+PRIORITY_WHITELIST_NORMALIZED = {
+    normalize_journal_name(name) for name in PRIORITY_WHITELIST_JOURNALS
+}
+
+
+def parse_attachment2_foreign_journals(text: str) -> list[str]:
+    return [record["journal_name"] for record in parse_attachment2_foreign_journal_records(text)]
+
+
+def parse_attachment2_foreign_journal_records(text: str) -> list[dict[str, str]]:
+    pattern = re.compile(
+        r"\d+T\d+\d+([A-Za-z&,:]+?)(\d{4}-[0-9X]{4})(\d{4}-[0-9X]{4})"
+    )
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(text):
+        name = match.group(1)
+        normalized = normalize_journal_name(name)
+        if normalized and normalized not in seen:
+            records.append(
+                {
+                    "journal_name": name,
+                    "issn": match.group(2),
+                    "eissn": match.group(3),
+                }
+            )
+            seen.add(normalized)
+    return records
+
+
+def _decode_pdf_hex(hex_text: str, cmap: dict[int, str]) -> str:
+    data = bytes.fromhex(hex_text)
+    result: list[str] = []
+    i = 0
+    while i < len(data):
+        two_byte = (data[i] << 8) | data[i + 1] if i + 1 < len(data) else data[i]
+        if i + 1 < len(data) and two_byte in cmap:
+            result.append(cmap[two_byte])
+            i += 2
+        elif data[i] in cmap:
+            result.append(cmap[data[i]])
+            i += 1
+        elif i + 1 < len(data):
+            result.append(chr(two_byte) if 32 <= two_byte <= 126 else "")
+            i += 2
+        else:
+            result.append(chr(data[i]) if 32 <= data[i] <= 126 else "")
+            i += 1
+    return "".join(result)
+
+
+def _inflate_pdf_streams(path: Path) -> list[bytes]:
+    data = path.read_bytes()
+    streams: list[bytes] = []
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", data, re.S):
+        try:
+            streams.append(zlib.decompress(match.group(1)))
+        except zlib.error:
+            continue
+    return streams
+
+
+def _parse_pdf_cmap(streams: list[bytes]) -> dict[int, str]:
+    cmap: dict[int, str] = {}
+    for stream in streams:
+        if b"begincmap" not in stream:
+            continue
+        text = stream.decode("latin1", "ignore")
+        for block in re.findall(r"beginbfchar\s*(.*?)\s*endbfchar", text, re.S):
+            for src, dst in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", block):
+                try:
+                    cmap[int(src, 16)] = bytes.fromhex(dst).decode("utf-16-be")
+                except UnicodeDecodeError:
+                    continue
+        for block in re.findall(r"beginbfrange\s*(.*?)\s*endbfrange", text, re.S):
+            for start, end, dst in re.findall(
+                r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>",
+                block,
+            ):
+                start_int = int(start, 16)
+                end_int = int(end, 16)
+                dst_int = int(dst, 16)
+                for code in range(start_int, end_int + 1):
+                    try:
+                        cmap[code] = chr(dst_int + code - start_int)
+                    except ValueError:
+                        continue
+    return cmap
+
+
+def extract_pdf_text(path: Path) -> str:
+    streams = _inflate_pdf_streams(path)
+    cmap = _parse_pdf_cmap(streams)
+    chunks: list[str] = []
+    for stream in streams:
+        if b" Tj" not in stream and b" TJ" not in stream:
+            continue
+        content = stream.decode("latin1", "ignore")
+        for match in re.finditer(r"<([0-9A-Fa-f]+)>|\(([^()]*)\)", content):
+            if match.group(1):
+                chunks.append(_decode_pdf_hex(match.group(1), cmap))
+            else:
+                chunks.append(match.group(2) or "")
+    return "".join(chunks)
+
+
+def build_journal_whitelist(
+    attachment_journals: list[str] | list[dict[str, str]] | None = None,
+) -> dict[str, dict[str, str]]:
+    whitelist: dict[str, dict[str, str]] = {}
+
+    def add(name: str, source: str, issn: str = "", eissn: str = "") -> None:
+        normalized = normalize_journal_name(name)
+        if not normalized:
+            return
+        if normalized not in whitelist:
+            whitelist[normalized] = {
+                "journal_name": name,
+                "normalized_name": normalized,
+                "source_list": source,
+                "issn": issn,
+                "eissn": eissn,
+                "openalex_source_id": "",
+                "openalex_display_name": "",
+            }
+        elif source not in whitelist[normalized]["source_list"].split(";"):
+            whitelist[normalized]["source_list"] += f";{source}"
+        if issn and not whitelist[normalized]["issn"]:
+            whitelist[normalized]["issn"] = issn
+        if eissn and not whitelist[normalized]["eissn"]:
+            whitelist[normalized]["eissn"] = eissn
+
+    for item in attachment_journals or []:
+        if isinstance(item, dict):
+            add(item["journal_name"], "附件2", item.get("issn", ""), item.get("eissn", ""))
+        else:
+            add(item, "附件2")
+    for name in sorted(UTD24_JOURNALS):
+        add(name, "UTD24")
+    for name in sorted(FT50_JOURNALS):
+        add(name, "FT50")
+    return whitelist
+
+
+def is_whitelisted_journal(
+    journal_name: str | None, whitelist: dict[str, dict[str, str]] | None
+) -> bool:
+    if not whitelist:
+        return False
+    return normalize_journal_name(journal_name) in whitelist
+
+
+def whitelist_sources_for_journal(
+    journal_name: str | None, whitelist: dict[str, dict[str, str]] | None
+) -> str:
+    if not whitelist:
+        return ""
+    entry = whitelist.get(normalize_journal_name(journal_name))
+    return entry["source_list"] if entry else ""
+
+
+def load_whitelist_from_attachment(attachment_path: Path) -> dict[str, dict[str, str]]:
+    text = extract_pdf_text(attachment_path)
+    attachment_records = parse_attachment2_foreign_journal_records(text)
+    return build_journal_whitelist(attachment_records)
+
+
+def write_whitelist_csv(path: Path, whitelist: dict[str, dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "journal_name",
+                "normalized_name",
+                "source_list",
+                "issn",
+                "eissn",
+                "openalex_source_id",
+                "openalex_display_name",
+            ],
+        )
+        writer.writeheader()
+        for row in sorted(whitelist.values(), key=lambda item: item["normalized_name"]):
+            writer.writerow(row)
+
+
+def read_whitelist_csv(path: Path) -> dict[str, dict[str, str]]:
+    whitelist: dict[str, dict[str, str]] = {}
+    if not path.exists():
+        return whitelist
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            normalized = row.get("normalized_name") or normalize_journal_name(row.get("journal_name"))
+            if not normalized:
+                continue
+            whitelist[normalized] = {
+                "journal_name": row.get("journal_name", ""),
+                "normalized_name": normalized,
+                "source_list": row.get("source_list", ""),
+                "issn": row.get("issn", ""),
+                "eissn": row.get("eissn", ""),
+                "openalex_source_id": row.get("openalex_source_id", ""),
+                "openalex_display_name": row.get("openalex_display_name", ""),
+            }
+    return whitelist
 
 
 def abstract_from_inverted_index(index: dict[str, list[int]] | None) -> str:
@@ -226,7 +564,9 @@ def parse_openalex_work(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def score_work(work: dict[str, Any]) -> dict[str, Any]:
+def score_work(
+    work: dict[str, Any], whitelist: dict[str, dict[str, str]] | None = None
+) -> dict[str, Any]:
     matched = matched_keyword_labels(work)
     score = 0
 
@@ -234,7 +574,11 @@ def score_work(work: dict[str, Any]) -> dict[str, Any]:
         score += 2
 
     normalized_journal = normalize_journal_name(work.get("journal"))
-    if normalized_journal in NORMALIZED_TARGET_JOURNALS:
+    whitelist_source = whitelist_sources_for_journal(work.get("journal"), whitelist)
+    if whitelist_source:
+        score += 6
+        source_match = "白名单期刊"
+    elif normalized_journal in NORMALIZED_TARGET_JOURNALS:
         score += 4
         source_match = "附件2/重点外文期刊"
     else:
@@ -256,6 +600,7 @@ def score_work(work: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(work)
     enriched["score"] = score
     enriched["source_match"] = source_match
+    enriched["whitelist_source"] = whitelist_source
     enriched["matched_keywords"] = "; ".join(matched)
     return enriched
 
@@ -272,7 +617,9 @@ def slugify_filename(title: str, doi: str = "") -> str:
     return f"{base}.pdf"
 
 
-def openalex_get(params: dict[str, str | int], timeout: int = 40) -> dict[str, Any]:
+def openalex_json_get(
+    base_url: str, params: dict[str, str | int], timeout: int = 40
+) -> dict[str, Any]:
     query = dict(params)
     api_key = os.environ.get("OPENALEX_API_KEY")
     mailto = os.environ.get("OPENALEX_MAILTO")
@@ -281,13 +628,79 @@ def openalex_get(params: dict[str, str | int], timeout: int = 40) -> dict[str, A
     if mailto:
         query["mailto"] = mailto
 
-    url = f"{OPENALEX_WORKS_URL}?{urllib.parse.urlencode(query)}"
+    url = f"{base_url}?{urllib.parse.urlencode(query)}"
     request = urllib.request.Request(url, headers={"User-Agent": "course-paper-search/1.0"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def search_openalex(limit_per_query: int, sleep_seconds: float) -> list[dict[str, Any]]:
+def openalex_get(params: dict[str, str | int], timeout: int = 40) -> dict[str, Any]:
+    return openalex_json_get(OPENALEX_WORKS_URL, params, timeout)
+
+
+def openalex_sources_get(params: dict[str, str | int], timeout: int = 40) -> dict[str, Any]:
+    return openalex_json_get(OPENALEX_SOURCES_URL, params, timeout)
+
+
+def short_openalex_id(openalex_id: str) -> str:
+    return openalex_id.rstrip("/").split("/")[-1]
+
+
+def resolve_openalex_source(entry: dict[str, str]) -> dict[str, str] | None:
+    for issn_key in ("issn", "eissn"):
+        issn = entry.get(issn_key)
+        if not issn:
+            continue
+        data = openalex_sources_get(
+            {
+                "filter": f"issn:{issn}",
+                "per-page": 1,
+                "select": "id,display_name,issn_l,issn,type",
+            }
+        )
+        if data.get("results"):
+            source = data["results"][0]
+            return {
+                "id": source.get("id", ""),
+                "display_name": source.get("display_name", ""),
+            }
+
+    data = openalex_sources_get(
+        {
+            "search": entry["journal_name"],
+            "per-page": 5,
+            "select": "id,display_name,issn_l,issn,type",
+        }
+    )
+    normalized = entry["normalized_name"]
+    for source in data.get("results") or []:
+        if normalize_journal_name(source.get("display_name")) == normalized:
+            return {
+                "id": source.get("id", ""),
+                "display_name": source.get("display_name", ""),
+            }
+    return None
+
+
+def enrich_whitelist_with_openalex_sources(
+    whitelist: dict[str, dict[str, str]], sleep_seconds: float
+) -> None:
+    for entry in whitelist.values():
+        if entry.get("openalex_source_id"):
+            continue
+        source = resolve_openalex_source(entry)
+        if source:
+            entry["openalex_source_id"] = source["id"]
+            entry["openalex_display_name"] = source["display_name"]
+        time.sleep(sleep_seconds)
+
+
+def search_openalex(
+    limit_per_query: int,
+    sleep_seconds: float,
+    whitelist: dict[str, dict[str, str]] | None = None,
+    strict_whitelist: bool = False,
+) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     fields = ",".join(
         [
@@ -323,13 +736,85 @@ def search_openalex(limit_per_query: int, sleep_seconds: float) -> list[dict[str
             work = parse_openalex_work(raw)
             if not is_topic_relevant(work) or is_excluded_publication(work):
                 continue
+            if strict_whitelist and not is_whitelisted_journal(work.get("journal"), whitelist):
+                continue
             key = (work.get("doi") or work.get("openalex_id") or work.get("title")).lower()
             if not key:
                 continue
-            scored = score_work(work)
+            scored = score_work(work, whitelist)
             if key not in rows or scored["score"] > rows[key]["score"]:
                 rows[key] = scored
         time.sleep(sleep_seconds)
+
+    return sorted(rows.values(), key=lambda item: (item["score"], item["cited_by_count"]), reverse=True)
+
+
+def search_openalex_by_whitelist_sources(
+    whitelist: dict[str, dict[str, str]],
+    per_source: int,
+    sleep_seconds: float,
+    priority_only: bool = False,
+) -> list[dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    fields = ",".join(
+        [
+            "id",
+            "doi",
+            "display_name",
+            "publication_year",
+            "publication_date",
+            "type",
+            "cited_by_count",
+            "primary_location",
+            "best_oa_location",
+            "locations",
+            "open_access",
+            "abstract_inverted_index",
+            "authorships",
+            "biblio",
+        ]
+    )
+
+    for entry in sorted(whitelist.values(), key=lambda item: item["normalized_name"]):
+        if priority_only and entry["normalized_name"] not in PRIORITY_WHITELIST_NORMALIZED:
+            continue
+        source_id = entry.get("openalex_source_id")
+        if not source_id:
+            continue
+        source_short_id = short_openalex_id(source_id)
+        filters = (
+            f"primary_location.source.id:{source_short_id},"
+            "from_publication_date:2020-01-01,"
+            "to_publication_date:2026-12-31,"
+            "type:article"
+        )
+        for query in SOURCE_QUERIES:
+            try:
+                data = openalex_get(
+                    {
+                        "search": query,
+                        "filter": filters,
+                        "per-page": per_source,
+                        "sort": "cited_by_count:desc",
+                        "select": fields,
+                    }
+                )
+            except (urllib.error.URLError, TimeoutError, OSError):
+                time.sleep(sleep_seconds)
+                continue
+            for raw in data.get("results") or []:
+                work = parse_openalex_work(raw)
+                if not is_topic_relevant(work) or is_excluded_publication(work):
+                    continue
+                if not is_whitelisted_journal(work.get("journal"), whitelist):
+                    continue
+                key = (work.get("doi") or work.get("openalex_id") or work.get("title")).lower()
+                if not key:
+                    continue
+                scored = score_work(work, whitelist)
+                if key not in rows or scored["score"] > rows[key]["score"]:
+                    rows[key] = scored
+            time.sleep(sleep_seconds)
 
     return sorted(rows.values(), key=lambda item: (item["score"], item["cited_by_count"]), reverse=True)
 
@@ -339,6 +824,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "rank",
         "score",
         "source_match",
+        "whitelist_source",
         "matched_keywords",
         "title",
         "authors",
@@ -403,9 +889,14 @@ def maybe_download_pdfs(rows: list[dict[str, Any]], output_dir: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit-per-query", type=int, default=50)
+    parser.add_argument("--per-source", type=int, default=30)
     parser.add_argument("--top-n", type=int, default=35)
     parser.add_argument("--sleep", type=float, default=0.2)
     parser.add_argument("--download-pdfs", action="store_true")
+    parser.add_argument("--strict-whitelist", action="store_true")
+    parser.add_argument("--priority-whitelist", action="store_true")
+    parser.add_argument("--write-whitelist", action="store_true")
+    parser.add_argument("--attachment2", default="附件2【期刊列表】.pdf")
     parser.add_argument("--out-dir", default="results")
     args = parser.parse_args()
 
@@ -413,10 +904,29 @@ def main() -> int:
     candidate_path = out_dir / "候选外文文献.csv"
     selected_path = out_dir / "外文35篇初筛.csv"
     manual_path = out_dir / "需要手动下载_外文.csv"
+    whitelist_path = out_dir / "journal_whitelist.csv"
     pdf_dir = Path("参考文献") / "外文开放获取"
 
+    whitelist = read_whitelist_csv(whitelist_path) or load_whitelist_from_attachment(Path(args.attachment2))
+    if args.write_whitelist or args.strict_whitelist:
+        enrich_whitelist_with_openalex_sources(whitelist, args.sleep)
+        write_whitelist_csv(whitelist_path, whitelist)
+
     try:
-        candidates = search_openalex(args.limit_per_query, args.sleep)
+        if args.strict_whitelist:
+            candidates = search_openalex_by_whitelist_sources(
+                whitelist,
+                per_source=args.per_source,
+                sleep_seconds=args.sleep,
+                priority_only=args.priority_whitelist,
+            )
+        else:
+            candidates = search_openalex(
+                args.limit_per_query,
+                args.sleep,
+                whitelist=whitelist,
+                strict_whitelist=False,
+            )
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 403, 429}:
             print(
@@ -444,6 +954,8 @@ def main() -> int:
     print(f"Wrote {len(candidates)} candidates to {candidate_path}")
     print(f"Wrote top {len(selected)} records to {selected_path}")
     print(f"Wrote {len(manual)} manual-download records to {manual_path}")
+    if args.write_whitelist or args.strict_whitelist:
+        print(f"Wrote {len(whitelist)} whitelist journals to {whitelist_path}")
     if args.download_pdfs:
         downloaded = sum(1 for row in selected if row.get("local_pdf"))
         print(f"Downloaded {downloaded} open-access PDFs to {pdf_dir}")

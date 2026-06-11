@@ -62,6 +62,17 @@ This writes:
 - `results/外文35篇初筛.csv`
 - `results/需要手动下载_外文.csv`
 
+Generate a journal whitelist from Attachment 2 plus UTD24 and FT50, then search
+only within priority whitelist journals:
+
+```bash
+python3 paper_search.py --strict-whitelist --priority-whitelist --write-whitelist --per-source 50 --top-n 35
+```
+
+This also writes:
+
+- `results/journal_whitelist.csv`
+
 To also try downloading open-access PDFs:
 
 ```bash
