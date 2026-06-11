@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+results/
+参考文献/
+
+附件*.pdf
+附件*.doc
+附件*.docx
+选题与关键词.txt
